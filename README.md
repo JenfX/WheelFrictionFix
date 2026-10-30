@@ -1,6 +1,7 @@
 # Wheel Friction Fix
 
 A [Pulsar](https://github.com/SpaceGT/Pulsar) plugin for **Space Engineers 1** that makes wheels behave on blocks the same way they do on voxels.
+Example: https://youtu.be/gjTuvnly680
 
 ## What it fixes
 
