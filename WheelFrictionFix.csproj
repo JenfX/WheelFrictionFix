@@ -1,0 +1,143 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>WheelFrictionFix</AssemblyName>
+    <RootNamespace>WheelFrictionFix</RootNamespace>
+    <!--
+      Local build only. Pulsar compiles the plugin from source and does not use this file.
+      The Bin64 path is detected automatically (see the ResolveGamePath target below).
+      Override: dotnet build -p:GamePath="D:\Games\SpaceEngineers\Bin64"
+      or the GamePath environment variable. A manual value takes priority.
+    -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Harmony ships with Pulsar, so it is not copied to the output. -->
+    <PackageReference Include="Lib.Harmony" Version="2.2.2" ExcludeAssets="runtime" />
+  </ItemGroup>
+
+  <!--
+    Finds Space Engineers: Steam from the registry, the default Steam folders and all
+    additional Steam libraries from steamapps\libraryfolders.vdf.
+    Returns the Bin64 path or an empty string.
+  -->
+  <UsingTask TaskName="FindSpaceEngineers"
+             TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <SteamPath ParameterType="System.String" Required="false" />
+      <Result ParameterType="System.String" Output="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Collections.Generic" />
+      <Using Namespace="System.Text.RegularExpressions" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        Result = "";
+
+        var roots = new List<string>();
+        if (!string.IsNullOrWhiteSpace(SteamPath))
+            roots.Add(SteamPath.Replace('/', '\\'));
+        roots.Add(@"C:\Program Files (x86)\Steam");
+        roots.Add(@"C:\Program Files\Steam");
+
+        // Additional Steam libraries (other drives).
+        foreach (var root in roots.ToArray())
+        {
+            var vdf = Path.Combine(root, "steamapps", "libraryfolders.vdf");
+            if (!File.Exists(vdf))
+                continue;
+
+            foreach (Match m in Regex.Matches(File.ReadAllText(vdf), "\"path\"\\s+\"([^\"]+)\""))
+                roots.Add(m.Groups[1].Value.Replace(@"\\", @"\"));
+        }
+
+        foreach (var root in roots)
+        {
+            var bin = Path.Combine(root, "steamapps", "common", "SpaceEngineers", "Bin64");
+            if (File.Exists(Path.Combine(bin, "Sandbox.Game.dll")))
+            {
+                Result = bin;
+                break;
+            }
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <!-- Runs before reference resolution so GamePath is known by then. -->
+  <Target Name="ResolveGamePath" BeforeTargets="ResolveAssemblyReferences">
+
+    <PropertyGroup>
+      <_SteamPath>$([MSBuild]::GetRegistryValue('HKEY_CURRENT_USER\SOFTWARE\Valve\Steam', 'SteamPath'))</_SteamPath>
+    </PropertyGroup>
+
+    <FindSpaceEngineers SteamPath="$(_SteamPath)" Condition="'$(GamePath)' == ''">
+      <Output TaskParameter="Result" PropertyName="GamePath" />
+    </FindSpaceEngineers>
+
+    <Error Condition="'$(GamePath)' == '' Or !Exists('$(GamePath)\Sandbox.Game.dll')"
+           Text="Space Engineers Bin64 folder not found. Set it manually: dotnet build -p:GamePath=&quot;D:\...\SpaceEngineers\Bin64&quot;" />
+
+    <Message Importance="high" Text="Space Engineers Bin64: $(GamePath)" />
+
+    <ItemGroup>
+      <Reference Include="Sandbox.Common">
+        <HintPath>$(GamePath)\Sandbox.Common.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="Sandbox.Game">
+        <HintPath>$(GamePath)\Sandbox.Game.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="VRage">
+        <HintPath>$(GamePath)\VRage.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="VRage.Game">
+        <HintPath>$(GamePath)\VRage.Game.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="VRage.Library">
+        <HintPath>$(GamePath)\VRage.Library.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+      <Reference Include="VRage.Math">
+        <HintPath>$(GamePath)\VRage.Math.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
+    </ItemGroup>
+
+  </Target>
+
+  <!--
+    After each build, copies the plugin to the Pulsar local plugins folder (SE1, Legacy):
+    %AppData%\Pulsar\Legacy\Local\WheelFrictionFix\plugin.dll
+    Other Pulsar folder: dotnet build -p:PulsarDir="D:\...\Pulsar"
+    Disable copying: dotnet build -p:DeployToPulsar=false
+    If the game is running, the DLL is locked: you get a warning, the build does not fail.
+  -->
+  <PropertyGroup>
+    <DeployToPulsar Condition="'$(DeployToPulsar)' == ''">true</DeployToPulsar>
+    <PulsarDir Condition="'$(PulsarDir)' == ''">$(APPDATA)\Pulsar</PulsarDir>
+  </PropertyGroup>
+
+  <Target Name="DeployToPulsar" AfterTargets="Build" Condition="'$(DeployToPulsar)' == 'true' And Exists('$(PulsarDir)')">
+    <PropertyGroup>
+      <_PulsarPluginDir>$(PulsarDir)\Legacy\Local\$(AssemblyName)</_PulsarPluginDir>
+    </PropertyGroup>
+
+    <Copy SourceFiles="$(TargetPath)"
+          DestinationFiles="$(_PulsarPluginDir)\plugin.dll"
+          ContinueOnError="WarnAndContinue" />
+    <Copy SourceFiles="$(TargetDir)$(AssemblyName).pdb"
+          DestinationFiles="$(_PulsarPluginDir)\plugin.pdb"
+          Condition="Exists('$(TargetDir)$(AssemblyName).pdb')"
+          ContinueOnError="WarnAndContinue" />
+
+    <Message Importance="high" Text="Plugin copied to $(_PulsarPluginDir)" />
+  </Target>
+
+</Project>
