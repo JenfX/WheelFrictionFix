@@ -20,22 +20,6 @@ Works with modded wheels that use the vanilla wheel and suspension logic.
 - Clients without the plugin still get the fixed behaviour from the server; they just do not see the checkbox.
 - Clients with the plugin can toggle the checkbox; the server checks block access and syncs the state to everyone.
 
-## Building locally
-
-Requirements: .NET SDK and Space Engineers installed through Steam.
-
-```
-dotnet build -c Release
-```
-
-The game folder is detected automatically. To set it manually:
-
-```
-dotnet build -c Release -p:GamePath="D:\Games\SpaceEngineers\Bin64"
-```
-
-After a build the DLL is copied to `%AppData%\Pulsar\Legacy\Local\WheelFrictionFix\plugin.dll`. `build.bat` does a full rebuild.
-
 ## License
 
 MIT
