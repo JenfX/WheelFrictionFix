@@ -92,6 +92,10 @@
         <HintPath>$(GamePath)\Sandbox.Game.dll</HintPath>
         <Private>false</Private>
       </Reference>
+      <Reference Include="HavokWrapper">
+        <HintPath>$(GamePath)\HavokWrapper.dll</HintPath>
+        <Private>false</Private>
+      </Reference>
       <Reference Include="VRage">
         <HintPath>$(GamePath)\VRage.dll</HintPath>
         <Private>false</Private>

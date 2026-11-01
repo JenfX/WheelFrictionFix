@@ -5,6 +5,8 @@ using System.Globalization;
 using System.Linq;
 using System.Reflection;
 using HarmonyLib;
+using Sandbox.Game.Entities.Blocks;
+using Sandbox.Game.Entities.Cube;
 using Sandbox.ModAPI;
 using Sandbox.ModAPI.Interfaces.Terminal;
 using VRage.Game.ModAPI;
@@ -21,17 +23,17 @@ namespace WheelFrictionFix
     /// (on by default). For wheels on suspensions with the checkbox on:
     ///  1. The contact friction against any block (armor, conveyors, etc.) equals the wheel
     ///     friction, as on voxels. Vanilla gives 7 % on armor and 100 % on functional blocks.
-    ///  2. When the wheel friction changes noticeably (e.g. a script zeroes it for a tank turn),
-    ///     the wheel contacts are recreated. Otherwise Havok keeps the old contact points with the
-    ///     old friction, and a vehicle standing on blocks cannot turn in place.
+    ///  2. When the suspension Friction setting changes noticeably (e.g. a script zeroes it for a
+    ///     tank turn) while the wheel is on a grid and slow, the wheel contacts are recreated.
+    ///     Otherwise Havok keeps the old contact points with the old friction, and a vehicle
+    ///     standing on blocks cannot turn in place. Terrain and fast wheels do not need this.
     ///
     /// The checkbox state is stored in the suspension block and saved with the world.
     ///
     /// Multiplayer: the server (or host) is authoritative. A client sends checkbox changes to the
     /// server, the server checks block access, stores the state and broadcasts it to everyone.
-    /// On join a client asks the server for the list of disabled suspensions. Friction and contact
-    /// recreation run on the server and on a client that predicts its vehicle physics.
-    /// The plugin only needs to be installed on the host/server; clients need it to see the checkbox.
+    /// On join a client asks the server for the list of disabled suspensions; until the server
+    /// answers (or if the server has no plugin) the client behaves like vanilla.
     /// </summary>
     public class Plugin : IPlugin
     {
@@ -42,8 +44,12 @@ namespace WheelFrictionFix
         private const float BlockFrictionMultiplier = 1f;
         private const float BlockFrictionCollector = 1f;
 
-        // Recreate contacts only when friction changes by more than 15 % or to/from 0,
-        // and at most 4 times per second per wheel.
+        // Recreate contacts only when the Friction setting changes by more than 15 % or to/from 0,
+        // at most 4 times per second per wheel, and only if the last surface the wheel touched was
+        // a grid (not terrain). The surface is "last seen", not "seen recently": a standing wheel on
+        // a grid gets almost no contact callbacks, which is exactly the case the recreation is for.
+        // There is no speed limit: tests showed that rolling wheels on a grid also keep their old
+        // contact friction (steering corrections at 6 m/s and above stuck as well).
         private const float SignificantChange = 0.15f;
         private const double RefreshMinInterval = 0.25;
 
@@ -56,9 +62,24 @@ namespace WheelFrictionFix
         private static readonly List<string> InitErrors = new List<string>();
         private static readonly ConcurrentDictionary<string, bool> LoggedErrors = new ConcurrentDictionary<string, bool>();
 
-        // Suspension EntityId -> checkbox. Cached so the physics thread does not read the storage.
+        // Suspension EntityId -> checkbox. Cached so the physics thread does not read the storage:
+        // on a cache miss the contact callback queues the id (CacheMisses) and the main thread
+        // reads the storage in Update.
         private static readonly ConcurrentDictionary<long, bool> Enabled = new ConcurrentDictionary<long, bool>();
+        private static readonly ConcurrentDictionary<long, bool> CacheMisses = new ConcurrentDictionary<long, bool>();
         private static Type storageComponentType;
+
+        // Suspension EntityId -> true if the last contact callback of its wheel was with a grid,
+        // false if with anything else (terrain).
+        private static readonly ConcurrentDictionary<long, bool> LastSurfaceIsGrid = new ConcurrentDictionary<long, bool>();
+
+        // False on a multiplayer client until the server has sent the state (MsgAllDisabled).
+        // While false the plugin behaves like vanilla, so a client on a server without the plugin
+        // does not disagree with the server physics.
+        private static volatile bool serverReady;
+        private static bool stateReceived;
+
+        private static AccessTools.FieldRef<MyWheel, float> frictionCollectorRef;
 
         // Contact recreation state (per suspension EntityId).
         private static readonly ConcurrentDictionary<long, float> LastFriction = new ConcurrentDictionary<long, float>();
@@ -79,9 +100,12 @@ namespace WheelFrictionFix
         private static readonly Action<ushort, byte[], ulong, bool> NetHandler = OnMessage;
         private static IMyMultiplayer registeredMultiplayer;
 
+        // Clients that already got the full state this session (MsgRequestAll is answered once).
+        private static readonly HashSet<ulong> AnsweredRequests = new HashSet<ulong>();
+
         private Harmony harmony;
         private bool controlsDone;
-        private bool chatShown;
+        private bool errorShown;
         private bool stateRequested;
         private object lastSession;
 
@@ -107,12 +131,13 @@ namespace WheelFrictionFix
 
             try
             {
-                var wheelType = AccessTools.TypeByName("Sandbox.Game.Entities.Blocks.MyWheel");
-                var contact = wheelType == null ? null : AccessTools.Method(wheelType, "ContactPointCallback");
+                var contact = AccessTools.Method(typeof(MyWheel), "ContactPointCallback");
                 if (contact == null)
                     InitErrors.Add("MyWheel.ContactPointCallback not found");
                 else
                     harmony.Patch(contact, postfix: new HarmonyMethod(typeof(Plugin), nameof(ContactPostfix)));
+
+                frictionCollectorRef = AccessTools.FieldRefAccess<MyWheel, float>("m_frictionCollector");
 
                 var suspensionType = AccessTools.TypeByName("Sandbox.Game.Entities.Cube.MyMotorSuspension");
                 var propagate = suspensionType == null ? null : AccessTools.Method(suspensionType, "PropagateFriction");
@@ -161,12 +186,17 @@ namespace WheelFrictionFix
             if (!ReferenceEquals(session, lastSession))
             {
                 lastSession = session;
-                chatShown = false;
+                errorShown = false;
                 stateRequested = false;
+                stateReceived = false;
+                serverReady = false;
                 UnregisterNetwork();
+                AnsweredRequests.Clear();
                 // The game removes added controls when a world unloads: add them again for the new world.
                 controlsDone = false;
                 Enabled.Clear();
+                CacheMisses.Clear();
+                LastSurfaceIsGrid.Clear();
                 LastFriction.Clear();
                 LastRefresh.Clear();
                 Pending.Clear();
@@ -176,22 +206,27 @@ namespace WheelFrictionFix
             if (session != null && registeredMultiplayer == null && MyAPIGateway.Multiplayer != null)
                 RegisterNetwork();
 
-            // Multiplayer client: ask the server once for the disabled suspensions.
+            // Singleplayer and server/host are authoritative; a multiplayer client waits for the server.
             var mp = MyAPIGateway.Multiplayer;
-            if (!stateRequested && session != null && session.Player != null && mp != null
-                && mp.MultiplayerActive && !mp.IsServer)
+            bool isClient = mp != null && mp.MultiplayerActive && !mp.IsServer;
+            serverReady = session != null && (!isClient || stateReceived);
+
+            // Multiplayer client: ask the server once for the disabled suspensions.
+            if (!stateRequested && isClient && session.Player != null)
             {
                 stateRequested = true;
                 Send(new[] { MsgRequestAll }, toServer: true);
             }
 
-            if (!chatShown && session != null && session.Player != null && MyAPIGateway.Utilities != null)
+            // Chat message only if something went wrong; success is in the log.
+            if (!errorShown && InitErrors.Count > 0 && session != null && session.Player != null && MyAPIGateway.Utilities != null)
             {
-                chatShown = true;
-                MyAPIGateway.Utilities.ShowMessage(Name, InitErrors.Count == 0
-                    ? "plugin initialized"
-                    : "plugin initialized with errors, see the game log");
+                errorShown = true;
+                MyAPIGateway.Utilities.ShowMessage(Name, "plugin initialized with errors, see the game log");
             }
+
+            if (!CacheMisses.IsEmpty)
+                ResolveCacheMisses();
 
             // First restore collisions for wheels disabled last frame, then disable new ones.
             if (!Disabled.IsEmpty)
@@ -242,25 +277,70 @@ namespace WheelFrictionFix
             checkbox.OffText = MyStringId.GetOrCompute("Off");
             checkbox.SupportsMultipleBlocks = true;
             checkbox.Visible = b => true;
-            checkbox.Enabled = b => true;
+            // On a multiplayer client the checkbox is active only after the server has answered.
+            checkbox.Enabled = b => serverReady;
             checkbox.Getter = b => IsOn(b);
             checkbox.Setter = (b, value) => RequestSet(b as IMyMotorSuspension, value);
             controls.AddControl<IMyMotorSuspension>(checkbox);
         }
 
+        /// <summary>Checkbox state (main thread only: may read the block storage).</summary>
         private static bool IsOn(IMyEntity suspension)
         {
             bool on;
             if (Enabled.TryGetValue(suspension.EntityId, out on))
                 return on;
 
+            on = ReadStorage(suspension);
+            Enabled[suspension.EntityId] = on;
+            return on;
+        }
+
+        private static bool ReadStorage(IMyEntity suspension)
+        {
             // No entry -> on by default.
             string value;
             var storage = suspension.Storage;
-            on = !(storage != null && storage.TryGetValue(StorageKey, out value)
-                   && value != null && value.StartsWith("0", StringComparison.Ordinal));
-            Enabled[suspension.EntityId] = on;
-            return on;
+            return !(storage != null && storage.TryGetValue(StorageKey, out value)
+                     && value != null && value.StartsWith("0", StringComparison.Ordinal));
+        }
+
+        /// <summary>
+        /// Checkbox state for the physics thread: cache only. On a miss the id is queued for the
+        /// main thread and the default (on) is used; if the block turns out to be off, its contacts
+        /// are recreated right after (ResolveCacheMisses).
+        /// </summary>
+        private static bool IsOnFromPhysics(long suspensionId)
+        {
+            if (!serverReady)
+                return false;
+
+            bool on;
+            if (Enabled.TryGetValue(suspensionId, out on))
+                return on;
+
+            CacheMisses[suspensionId] = true;
+            return true;
+        }
+
+        private static void ResolveCacheMisses()
+        {
+            foreach (var id in CacheMisses.Keys.ToArray())
+            {
+                bool ignored;
+                CacheMisses.TryRemove(id, out ignored);
+                if (Enabled.ContainsKey(id))
+                    continue;
+
+                var suspension = MyAPIGateway.Entities.GetEntityById(id) as IMyMotorSuspension;
+                if (suspension == null)
+                    continue;
+
+                bool on = ReadStorage(suspension);
+                Enabled[id] = on;
+                if (!on)
+                    RefreshNow(suspension);
+            }
         }
 
         private static void SetOn(IMyEntity suspension, bool on)
@@ -375,7 +455,8 @@ namespace WheelFrictionFix
 
                     case MsgRequestAll:
                     {
-                        if (!isServer)
+                        // The scan walks the whole world: answer each client once per session.
+                        if (!isServer || !AnsweredRequests.Add(sender))
                             return;
 
                         var ids = CollectDisabledSuspensions();
@@ -399,10 +480,16 @@ namespace WheelFrictionFix
                             long id = BitConverter.ToInt64(data, 5 + i * 8);
                             var suspension = MyAPIGateway.Entities.GetEntityById(id) as IMyMotorSuspension;
                             if (suspension != null)
-                                ApplyState(suspension, false);
+                                SetOn(suspension, false);
                             else
                                 Enabled[id] = false;
                         }
+
+                        // The server has the plugin: switch from vanilla to the plugin behaviour and
+                        // recreate the contacts that were created while waiting.
+                        stateReceived = true;
+                        serverReady = true;
+                        RefreshAllSuspensions();
                         return;
                     }
                 }
@@ -447,6 +534,22 @@ namespace WheelFrictionFix
                 }
             }
             return result;
+        }
+
+        /// <summary>Recreates the contacts of all suspensions known to this machine.</summary>
+        private static void RefreshAllSuspensions()
+        {
+            var grids = new HashSet<IMyEntity>();
+            MyAPIGateway.Entities.GetEntities(grids, e => e is IMyCubeGrid);
+
+            var blocks = new List<IMySlimBlock>();
+            foreach (IMyCubeGrid grid in grids)
+            {
+                blocks.Clear();
+                grid.GetBlocks(blocks, b => b.FatBlock is IMyMotorSuspension);
+                foreach (var block in blocks)
+                    RefreshNow((IMyMotorSuspension)block.FatBlock);
+            }
         }
 
         private static byte[] EncodeState(byte type, long id, bool on)
@@ -502,28 +605,30 @@ namespace WheelFrictionFix
         // ================= Contact friction =================
 
         /// <summary>
-        /// After MyWheel.ContactPointCallback: if the wheel touches a grid, set the contact friction
-        /// as on voxels (vanilla uses 7 % on armor and 100 % on other blocks).
+        /// After MyWheel.ContactPointCallback (physics thread): remember the surface type, and if
+        /// the wheel touches a grid, set the contact friction as on voxels (vanilla uses 7 % on armor
+        /// and 100 % on other blocks).
         /// </summary>
-        public static void ContactPostfix(object __instance, object[] __args)
+        public static void ContactPostfix(MyWheel __instance, ref MyGridContactInfo value)
         {
             try
             {
-                var top = __instance as IMyAttachableTopBlock;
-                var suspension = top == null ? null : top.Base as IMyMotorSuspension;
+                var suspension = ((IMyAttachableTopBlock)__instance).Base as IMyMotorSuspension;
                 if (suspension == null)
                     return;
 
-                object info = __args[0];
-                if (!(GetMember(info, "CollidingEntity") is IMyCubeGrid))
-                    return;
-                if (!IsOn(suspension))
+                long id = suspension.EntityId;
+                bool onGrid = value.CollidingEntity is IMyCubeGrid;
+                LastSurfaceIsGrid[id] = onGrid;
+
+                if (!onGrid || !IsOnFromPhysics(id))
                     return;
 
-                float wheelFriction = Convert.ToSingle(GetMember(__instance, "Friction"), CultureInfo.InvariantCulture);
-                object properties = GetMember(GetMember(info, "Event"), "ContactProperties");
-                SetMember(properties, "Friction", wheelFriction * BlockFrictionMultiplier);
-                SetMember(__instance, "m_frictionCollector", BlockFrictionCollector);
+                // HkContactPointProperties wraps a native pointer: setting it on the copy changes the contact.
+                var properties = value.Event.ContactProperties;
+                properties.Friction = __instance.Friction * BlockFrictionMultiplier;
+                if (frictionCollectorRef != null)
+                    frictionCollectorRef(__instance) = BlockFrictionCollector;
             }
             catch (Exception e)
             {
@@ -534,32 +639,42 @@ namespace WheelFrictionFix
         // ================= Contact recreation =================
 
         /// <summary>
-        /// After MyMotorSuspension.PropagateFriction (wheel friction changed): on a noticeable
-        /// change, schedule a recreation of the wheel contacts.
+        /// After MyMotorSuspension.PropagateFriction. Recreation is scheduled only when the Friction
+        /// setting itself changed noticeably (not the brake, which doubles the wheel friction without
+        /// touching the setting) and the wheel was last on a grid.
         /// </summary>
         public static void PropagateFrictionPostfix(object __instance)
         {
             try
             {
                 var suspension = __instance as IMyMotorSuspension;
-                if (suspension == null || !IsOn(suspension))
-                    return;
-
-                object physics;
-                float friction;
-                if (!TryGetWheel(suspension, out physics, out friction))
+                if (suspension == null || !serverReady || !IsOn(suspension))
                     return;
 
                 long id = suspension.EntityId;
+                float setting = suspension.Friction;
+
+                // The baseline is the setting at the last recreation, so slow gradual changes
+                // (a script easing the friction) still add up to a recreation.
                 float last;
                 if (!LastFriction.TryGetValue(id, out last))
                 {
-                    LastFriction[id] = friction;
+                    LastFriction[id] = setting;
+                    return;
+                }
+                if (!IsSignificantChange(last, setting))
+                    return;
+
+                // Terrain: contacts renew by themselves, just move the baseline.
+                if (!LastSurfaceWasGrid(id))
+                {
+                    LastFriction[id] = setting;
                     return;
                 }
 
-                if (IsSignificantChange(last, friction))
-                    Schedule(id, physics, friction);
+                object physics;
+                if (TryGetWheelPhysics(suspension, out physics))
+                    Schedule(id, physics, setting);
             }
             catch (Exception e)
             {
@@ -567,14 +682,14 @@ namespace WheelFrictionFix
             }
         }
 
+        /// <summary>Immediate recreation (checkbox toggled, state received), no surface or speed checks.</summary>
         private static void RefreshNow(IMyMotorSuspension suspension)
         {
             try
             {
                 object physics;
-                float friction;
-                if (suspension != null && TryGetWheel(suspension, out physics, out friction))
-                    Schedule(suspension.EntityId, physics, friction);
+                if (suspension != null && TryGetWheelPhysics(suspension, out physics))
+                    Schedule(suspension.EntityId, physics, suspension.Friction);
             }
             catch (Exception e)
             {
@@ -582,21 +697,21 @@ namespace WheelFrictionFix
             }
         }
 
-        private static bool TryGetWheel(IMyMotorSuspension suspension, out object physics, out float friction)
+        private static bool LastSurfaceWasGrid(long id)
+        {
+            bool onGrid;
+            return LastSurfaceIsGrid.TryGetValue(id, out onGrid) && onGrid;
+        }
+
+        private static bool TryGetWheelPhysics(IMyMotorSuspension suspension, out object physics)
         {
             physics = null;
-            friction = 0f;
-
-            object wheel = GetMember(suspension, "TopBlock");
-            if (wheel == null || FindProperty(wheel.GetType(), "Friction") == null)
+            var wheel = suspension.Top as MyWheel;
+            if (wheel == null || wheel.CubeGrid == null)
                 return false;
 
-            physics = GetMember(GetMember(wheel, "CubeGrid"), "Physics");
-            if (physics == null)
-                return false;
-
-            friction = Convert.ToSingle(GetMember(wheel, "Friction"), CultureInfo.InvariantCulture);
-            return true;
+            physics = wheel.CubeGrid.Physics;
+            return physics != null;
         }
 
         private static bool IsSignificantChange(float from, float to)
